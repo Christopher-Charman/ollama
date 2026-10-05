@@ -445,6 +445,12 @@ var tensorImportTransformRegistry = map[string]tensorImportTransformFactory{
 	"NemotronHForCausalLM":                  newNemotronHImportTransform,
 }
 
+// nvfp4GlobalScaleArchitectures get an NVFP4 global scale on import. Their
+// runners must apply it to every NVFP4 tensor.
+var nvfp4GlobalScaleArchitectures = map[string]bool{
+	"Kolibri1ForCausalLM": true,
+}
+
 func newTensorImportTransform(inv Inventory) (quantizePolicy, error) {
 	if factory, ok := tensorImportTransformRegistry[inv.Config.Architecture()]; ok {
 		return factory(inv.RawConfig)
