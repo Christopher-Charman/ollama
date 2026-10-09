@@ -29,6 +29,7 @@
       "cacheVariables": {
         "GGML_CPU_ALL_VARIANTS": "OFF",
         "GGML_NATIVE": "ON",
+        "GGML_BACKEND_DL": "OFF",
         "GGML_OPENMP": "OFF",
         "OLLAMA_RUNNER_DIR": ""
       }
