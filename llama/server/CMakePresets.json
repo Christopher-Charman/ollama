@@ -23,6 +23,26 @@
       }
     },
     {
+      "name": "cpu_native_xeon",
+      "inherits": ["cpu"],
+      "binaryDir": "${sourceDir}/../../build/llama-server-cpu_native_xeon",
+      "cacheVariables": {
+        "GGML_CPU_ALL_VARIANTS": "OFF",
+        "GGML_NATIVE": "ON",
+        "GGML_BACKEND_DL": "OFF",
+        "GGML_OPENMP": "OFF",
+        "OLLAMA_RUNNER_DIR": ""
+      }
+    },
+    {
+      "name": "cpu_native_xeon_openmp",
+      "inherits": ["cpu_native_xeon"],
+      "binaryDir": "${sourceDir}/../../build/llama-server-cpu_native_xeon_openmp",
+      "cacheVariables": {
+        "GGML_OPENMP": "ON"
+      }
+    },
+    {
       "name": "cpu_windows",
       "inherits": ["cpu"],
       "cacheVariables": {
@@ -236,6 +256,16 @@
     {
       "name": "cpu",
       "configurePreset": "cpu",
+      "targets": ["llama-server", "llama-quantize"]
+    },
+    {
+      "name": "cpu_native_xeon",
+      "configurePreset": "cpu_native_xeon",
+      "targets": ["llama-server", "llama-quantize"]
+    },
+    {
+      "name": "cpu_native_xeon_openmp",
+      "configurePreset": "cpu_native_xeon_openmp",
       "targets": ["llama-server", "llama-quantize"]
     },
     {

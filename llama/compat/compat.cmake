@@ -34,8 +34,17 @@ get_filename_component(_ollama_patch_applier
 # Instead, llama/server/CMakeLists.txt does target_sources() on the llama
 # target after FetchContent_MakeAvailable. That keeps Ollama's code in
 # Ollama's tree and makes the patch pure call-site insertions.
+# FetchContent PATCH_COMMAND launches a separate cmake -P process without
+# inheriting the parent CMake cache. Forward a resolved Git executable if
+# supplied/discovered, while leaving default PATH discovery unchanged.
+set(_ollama_git_patch_arg)
+if(DEFINED GIT_EXECUTABLE AND NOT "${GIT_EXECUTABLE}" STREQUAL "")
+    list(APPEND _ollama_git_patch_arg "-DGIT_EXECUTABLE:FILEPATH=${GIT_EXECUTABLE}")
+endif()
+
 set(OLLAMA_LLAMA_CPP_COMPAT_PATCH_COMMAND
     ${CMAKE_COMMAND}
+        ${_ollama_git_patch_arg}
         -DPATCH_DIR=${_compat_dir}
         -DPATCH_LABEL=llama/compat
         -P ${_ollama_patch_applier}
