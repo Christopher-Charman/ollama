@@ -1,0 +1,52 @@
+name: powerpc-xeon-source-smoke
+
+on:
+  pull_request:
+    paths:
+      - "llama/compat/compat.cmake"
+      - "llama/server/CMakePresets.json"
+      - "scripts/powerpc_cpu_ab_benchmark.py"
+      - ".github/workflows/powerpc-xeon-source-smoke.yml"
+  push:
+    branches: [main]
+    paths:
+      - "llama/compat/compat.cmake"
+      - "llama/server/CMakePresets.json"
+      - "scripts/powerpc_cpu_ab_benchmark.py"
+      - ".github/workflows/powerpc-xeon-source-smoke.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  xeon-smoke:
+    name: Xeon-native preset and benchmark smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Parse CMake presets
+        run: |
+          python -m json.tool llama/server/CMakePresets.json >/dev/null
+          cmake --list-presets -S llama/server
+      - name: Run offline benchmark parser and deterministic controls
+        run: |
+          python -m py_compile scripts/powerpc_cpu_ab_benchmark.py
+          python scripts/powerpc_cpu_ab_benchmark.py --self-test
+      - name: Verify default benchmark is non-executing
+        run: |
+          python scripts/powerpc_cpu_ab_benchmark.py --model gemma3:270m-core --warm-repeats 7 --blocks 2 > /tmp/bench-plan.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          receipt = json.loads(Path('/tmp/bench-plan.json').read_text())
+          assert receipt['status'] == 'DRY_RUN'
+          assert len(receipt['block_order']) == 4
+          print('DRY_RUN_GATE_PASS')
+          PY
