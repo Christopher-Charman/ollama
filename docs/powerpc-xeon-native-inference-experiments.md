@@ -22,10 +22,10 @@ Both new presets are explicit experiments, not a portable release. No runtime co
 
 ## Build admission
 
-- Verify the actual managed PowerPC Unix identity `csh3280350` / UID `2257347` and execution namespace before acting. Do not confuse the provider SSH gateway with the managed Passenger runtime, or use Evenio.
+- Verify the intended managed PowerPC runtime identity and execution namespace from private deployment configuration before acting. Do not commit provider account names, numeric UIDs, or absolute home paths. Do not confuse the provider SSH gateway with the managed Passenger runtime, or use Evenio.
 - Check the executable CMake/GCC/Go toolchain, the host's CPU flags and permitted core affinity, and Linux/glibc compatibility. The current Ollama fork declares `go 1.26.0`; availability of an adequate Go compiler **has not** been established by the fork.
 - Check the live Concurrency Ledger and sibling worker intentions immediately before a compile or substantial RAM/CPU test. Do not interfere with concurrently running PowerPC workloads.
-- Work in isolated source/build directories; keep existing `/home/storage/781/4477781/user/webapp/miniconda/bin/ollama` and model files intact.
+- Work in isolated source/build directories; keep the live Ollama binary path and model store from private runtime configuration intact.
 - Start with the fork's pinned llama.cpp source and its original compatibility patches (do not mix backend version changes with compiler flags). Verify the fetched and patched checkout, and run compile and integration tests independently.
 - Validate configure: `cmake -S llama/server --preset cpu_native_xeon`. Validate build: `cmake --build build/llama-server-cpu_native_xeon --target llama-server --parallel 3`. Repeat for `cpu_native_xeon_openmp` only once the first candidate passes. Do not assume these build commands have succeeded merely because the presets are syntactically valid.
 - Inspect `ldd` on generated binaries, CPU ISA, dynamic backend loading and model startup before attempting any service launch. No production service may point to the candidate without explicit run acceptance.
