@@ -143,6 +143,43 @@ def selftest():
     print("SELFTEST_PASS parsing order configuration incomplete_stream")
 
 
+def verify_pinned_blob(model, expected_sha256):
+    """Prove that Ollama and native aliases resolve to the same exact GGUF."""
+    root = os.path.join(os.path.expanduser("~"), "webapp", ".ollama", "models", "blobs")
+    expected_path = os.path.join(root, "sha256-" + expected_sha256)
+    show_req = urllib.request.Request(
+        "http://127.0.0.1:11434/api/show",
+        json.dumps({"model": model}).encode("utf-8"),
+        {"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(show_req, timeout=10) as response:
+        show = json.load(response)
+    from_lines = [line.strip()[5:].strip() for line in show.get("modelfile", "").splitlines()
+                  if line.strip().startswith("FROM ")]
+    if from_lines != [expected_path]:
+        raise RuntimeError("OLLAMA_MODEL_BLOB_NOT_PINNED")
+    with urllib.request.urlopen("http://127.0.0.1:18086/models", timeout=10) as response:
+        catalog = json.load(response)
+    matching = [item for item in catalog.get("data", [])
+                if model == item.get("id") or model in item.get("aliases", [])]
+    if len(matching) != 1:
+        raise RuntimeError("NATIVE_ALIAS_NOT_UNIQUE")
+    argv = matching[0].get("status", {}).get("args", [])
+    if argv.count("--model") != 1 or argv.index("--model") + 1 >= len(argv):
+        raise RuntimeError("NATIVE_MODEL_PATH_MISSING")
+    if argv[argv.index("--model") + 1] != expected_path:
+        raise RuntimeError("ENGINE_MODEL_BLOBS_DIFFER")
+    if os.path.islink(expected_path) or not os.path.isfile(expected_path):
+        raise RuntimeError("PINNED_BLOB_NOT_REGULAR_FILE")
+    digest = hashlib.sha256()
+    with open(expected_path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    if digest.hexdigest() != expected_sha256:
+        raise RuntimeError("PINNED_BLOB_CONTENT_MISMATCH")
+    return os.path.getsize(expected_path)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--self-test", action="store_true")
@@ -179,10 +216,12 @@ def main(argv=None):
     if not args.output or not os.path.isabs(args.output):
         ap.error("exclusive absolute private receipt path is required")
     require_headroom(args.min_available_mib)
+    verified_model_bytes = verify_pinned_blob(args.model, args.gguf_sha256)
     fd = os.open(args.output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         with os.fdopen(fd, "w") as receipt:
             header = dict(summary, status="STARTED", model_sha256=args.gguf_sha256,
+                          model_blob_verified=True, model_blob_bytes=verified_model_bytes,
                           uid=os.getuid(), host=platform.node(), python=sys.version.split()[0],
                           recorded_epoch=time.time(), endpoints=["127.0.0.1:11434", "127.0.0.1:18086"])
             receipt.write(json.dumps(header, sort_keys=True) + "\n")
