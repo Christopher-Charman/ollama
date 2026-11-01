@@ -237,6 +237,8 @@ def main(argv=None):
                     receipt.write(json.dumps(measured, sort_keys=True) + "\n")
                     receipt.flush()
                     os.fsync(receipt.fileno())
+            if verify_pinned_blob(args.model, args.gguf_sha256) != verified_model_bytes:
+                raise RuntimeError("MODEL_IDENTITY_CHANGED_DURING_BENCHMARK")
             receipt.write(json.dumps({"status": "DONE"}) + "\n")
             receipt.flush()
             os.fsync(receipt.fileno())
