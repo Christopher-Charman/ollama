@@ -229,6 +229,8 @@ def main(argv=None):
                 for i in range(args.warm_repeats + 1):
                     before = require_headroom(args.min_available_mib)
                     measured = measure(engine, args.model)
+                    if measured["meminfo_after_kib"].get("MemAvailable", 0) < args.min_available_mib * 1024:
+                        raise RuntimeError("MEMORY_HEADROOM_BELOW_GATE_AFTER_REQUEST")
                     measured.update({"phase": "load_or_cold" if i == 0 else "warm",
                                      "meminfo_before_kib": before,
                                      "block_engine": engine})
