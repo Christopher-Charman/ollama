@@ -1644,6 +1644,38 @@ func testIntPtr(v int) *int {
 	return &v
 }
 
+func TestCPUMmapUnderPressure(t *testing.T) {
+	useMmap := true
+	noMmap := false
+	tests := []struct {
+		name      string
+		goos      string
+		opts      api.Options
+		gpus      []ml.DeviceInfo
+		modelSize uint64
+		available uint64
+		want      bool
+	}{
+		{name: "linux cpu model exceeds available RAM", goos: "linux", opts: api.Options{Runner: api.Runner{NumGPU: 0}}, modelSize: 4 * format.GigaByte, available: 2 * format.GigaByte, want: true},
+		{name: "linux CPU discovered with no devices", goos: "linux", opts: api.Options{Runner: api.Runner{NumGPU: -1}}, modelSize: 4 * format.GigaByte, available: 2 * format.GigaByte, want: true},
+		{name: "linux CPU device", goos: "linux", opts: api.Options{Runner: api.Runner{NumGPU: -1}}, gpus: []ml.DeviceInfo{{DeviceID: ml.DeviceID{Library: "cpu"}}}, modelSize: 4 * format.GigaByte, available: 2 * format.GigaByte, want: true},
+		{name: "normal CPU load retains old default", goos: "linux", opts: api.Options{Runner: api.Runner{NumGPU: 0}}, modelSize: 2 * format.GigaByte, available: 4 * format.GigaByte},
+		{name: "equality retains old default", goos: "linux", opts: api.Options{Runner: api.Runner{NumGPU: 0}}, modelSize: 2 * format.GigaByte, available: 2 * format.GigaByte},
+		{name: "unknown model size retains old default", goos: "linux", opts: api.Options{Runner: api.Runner{NumGPU: 0}}, available: 2 * format.GigaByte},
+		{name: "unknown available memory retains old default", goos: "linux", opts: api.Options{Runner: api.Runner{NumGPU: 0}}, modelSize: 4 * format.GigaByte},
+		{name: "explicit mmap wins", goos: "linux", opts: api.Options{Runner: api.Runner{NumGPU: 0, UseMMap: &useMmap}}, modelSize: 4 * format.GigaByte, available: 2 * format.GigaByte},
+		{name: "explicit no-mmap wins", goos: "linux", opts: api.Options{Runner: api.Runner{NumGPU: 0, UseMMap: &noMmap}}, modelSize: 4 * format.GigaByte, available: 2 * format.GigaByte},
+		{name: "GPU load unaffected", goos: "linux", opts: api.Options{Runner: api.Runner{NumGPU: -1}}, gpus: []ml.DeviceInfo{{DeviceID: ml.DeviceID{Library: "CUDA"}}}, modelSize: 4 * format.GigaByte, available: 2 * format.GigaByte},
+		{name: "macOS CPU fallback unchanged", goos: "darwin", opts: api.Options{Runner: api.Runner{NumGPU: 0}}, modelSize: 4 * format.GigaByte, available: 2 * format.GigaByte},
+		{name: "Windows CPU fallback unchanged", goos: "windows", opts: api.Options{Runner: api.Runner{NumGPU: 0}}, modelSize: 4 * format.GigaByte, available: 2 * format.GigaByte},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.want, cpuMmapUnderPressure(tt.goos, tt.opts, tt.gpus, tt.modelSize, tt.available))
+		})
+	}
+}
+
 func TestDisableMmapDefaultReason(t *testing.T) {
 	useMmap := true
 	tests := []struct {

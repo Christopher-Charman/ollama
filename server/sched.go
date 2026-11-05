@@ -1159,7 +1159,16 @@ func (s *Scheduler) applyLlamaServerMmapDefaults(req *LlmRequest, launchOpts api
 	predictedVRAM := llm.PredictServerVRAM(req.model.ModelPath, f, predictedCtx)
 	availableVRAM, _, _ := availableMemoryForPlacement(systemInfo, gpus, launchOpts)
 
-	if reason := disableMmapDefaultReason(runtime.GOOS, req.opts, gpus, f.KV().BlockCount(), predictedVRAM, availableVRAM); reason != "" {
+	// A CPU-only model larger than available host RAM would otherwise be
+	// copied into anonymous pages and compete with swap. Prefer file-backed
+	// weights for this measured host-pressure case; keep the existing fast
+	// no-mmap CPU default when the model fits, and respect explicit settings.
+	if cpuMmapUnderPressure(runtime.GOOS, req.opts, gpus, modelFileSize(req.model.modelPaths()...), systemInfo.FreeMemory) {
+		useMmap := true
+		req.opts.UseMMap = &useMmap
+		req.useMMapAuto = true
+		slog.Info("using mmap for CPU model under host memory pressure", "model", req.model.ModelPath)
+	} else if reason := disableMmapDefaultReason(runtime.GOOS, req.opts, gpus, f.KV().BlockCount(), predictedVRAM, availableVRAM); reason != "" {
 		useMmap := false
 		req.opts.UseMMap = &useMmap
 		req.useMMapAuto = true
@@ -1172,6 +1181,17 @@ func (s *Scheduler) applyLlamaServerMmapDefaults(req *LlmRequest, launchOpts api
 
 	launchOpts.UseMMap = req.opts.UseMMap
 	return launchOpts
+}
+
+// cpuMmapUnderPressure is an inexpensive, portable-by-fallback CPU load-mode
+// decision. It only changes the automatic Linux CPU default when model bytes
+// cannot fit in the currently available host memory. It never changes context,
+// quantization, output limits, or an explicit use_mmap option.
+func cpuMmapUnderPressure(goos string, opts api.Options, gpus []ml.DeviceInfo, modelSize, availableMemory uint64) bool {
+	return goos == "linux" &&
+		opts.UseMMap == nil &&
+		(opts.NumGPU == 0 || len(gpus) == 0 || allDevicesLibrary(gpus, "cpu")) &&
+		modelSize > 0 && availableMemory > 0 && modelSize > availableMemory
 }
 
 func disableMmapDefaultReason(goos string, opts api.Options, gpus []ml.DeviceInfo, blockCount, predictedVRAM, availableVRAM uint64) string {
