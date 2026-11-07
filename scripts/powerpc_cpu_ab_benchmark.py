@@ -15,10 +15,13 @@ import random
 import re
 import sys
 import time
+import urllib.error
 import urllib.request
 
 OLLAMA = "http://127.0.0.1:11434/api/generate"
 NATIVE = "http://127.0.0.1:18086/completion"
+NATIVE_HEALTH = "http://127.0.0.1:18086/health"
+MEMORY_FLOOR_MIB = 4608
 ALLOWED = ("gemma3:270m-core", "qwen2.5-coder:1.5b-instruct-q4_K_M")
 PROMPT = "Explain in two sentences how a checksum detects changes to a file."
 REQ_TOKENS = 48
@@ -40,6 +43,41 @@ def require_headroom(min_mib):
         raise RuntimeError("MEMORY_HEADROOM_BELOW_GATE: available MiB=%d; required=%d" %
                            (values.get("MemAvailable", 0) // 1024, min_mib))
     return values
+
+
+def wait_native_ready(timeout_seconds, min_mib, *,
+                      opener=urllib.request.urlopen,
+                      clock=time.monotonic, sleep=time.sleep,
+                      check_headroom=None):
+    """Treat HTTP 503 as model loading, not a failed inference sample.
+
+    Only local host readiness is probed; this never retries a partly streamed
+    inference request, changes provider state, or evicts another model.
+    """
+    if check_headroom is None:
+        check_headroom = lambda: require_headroom(min_mib)
+    started = clock()
+    status_counts = {}
+    while True:
+        check_headroom()
+        try:
+            with opener(NATIVE_HEALTH, timeout=5) as response:
+                status = response.status
+        except urllib.error.HTTPError as error:
+            status = error.code
+            error.close()
+        except urllib.error.URLError:
+            status = 0
+        status_counts[status] = status_counts.get(status, 0) + 1
+        if status == 200:
+            return {"wait_ms": round((clock() - started) * 1000, 3),
+                    "status_counts": status_counts}
+        if status not in (0, 503):
+            raise RuntimeError("NATIVE_READINESS_UNEXPECTED_HTTP_%s" % status)
+        remaining = timeout_seconds - (clock() - started)
+        if remaining <= 0:
+            raise RuntimeError("NATIVE_READINESS_TIMEOUT")
+        sleep(min(1, remaining))
 
 
 def payload(engine, model):
@@ -170,6 +208,34 @@ def selftest():
     assert prompt_stats("ollama", {"prompt_eval_count": 14, "prompt_eval_duration": 140000000}) == (14, 140.0, 100.0)
     assert prompt_stats("native", {"timings": {"prompt_n": 14, "prompt_ms": 70}}) == (14, 70.0, 200.0)
     assert prompt_stats("native", {"timings": {}}) == (None, None, None)
+    # The candidate emits 503 while loading. Poll until 200; never retry a
+    # partially streamed inference, and reject a real server error.
+    class HealthyResponse:
+        status = 200
+        def __enter__(self):
+            return self
+        def __exit__(self, *_):
+            return False
+    codes = iter((503, 503, 200))
+    def loading_opener(url, timeout):
+        assert url == NATIVE_HEALTH and timeout == 5
+        code = next(codes)
+        if code == 503:
+            raise urllib.error.HTTPError(url, 503, "loading", None, None)
+        return HealthyResponse()
+    proof = wait_native_ready(5, MEMORY_FLOOR_MIB,
+                              opener=loading_opener, sleep=lambda _: None,
+                              check_headroom=lambda: None)
+    assert proof["status_counts"] == {503: 2, 200: 1}
+    def broken_opener(url, timeout):
+        raise urllib.error.HTTPError(url, 500, "failure", None, None)
+    try:
+        wait_native_ready(5, MEMORY_FLOOR_MIB, opener=broken_opener,
+                          sleep=lambda _: None, check_headroom=lambda: None)
+    except RuntimeError as error:
+        assert str(error) == "NATIVE_READINESS_UNEXPECTED_HTTP_500"
+    else:
+        raise AssertionError("non-loading HTTP 500 must fail")
     fake_o = [b'{"response":"OK","done":false}\n',
               b'{"response":"","done":true,"eval_count":1,"eval_duration":1000000000}\n']
     fake_n = [b'data: {"content":"OK","stop":false}\n',
@@ -231,7 +297,8 @@ def main(argv=None):
     ap.add_argument("--warm-repeats", type=int, default=7)
     ap.add_argument("--blocks", type=int, default=2)
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--min-available-mib", type=int, default=4608)
+    ap.add_argument("--min-available-mib", type=int, default=MEMORY_FLOOR_MIB)
+    ap.add_argument("--native-ready-timeout-seconds", type=int, default=180)
     ap.add_argument("--expected-uid", type=int)
     ap.add_argument("--gguf-sha256")
     ap.add_argument("--output")
@@ -241,8 +308,11 @@ def main(argv=None):
         return 0
     if not 5 <= args.warm_repeats <= 30 or not 1 <= args.blocks <= 10:
         ap.error("warm-repeats must be 5..30 and blocks 1..10")
-    if args.min_available_mib < 4096:
-        ap.error("minimum available memory may not be less than 4096 MiB")
+    if args.min_available_mib < MEMORY_FLOOR_MIB:
+        ap.error("minimum available memory may not be less than %d MiB" %
+                 MEMORY_FLOOR_MIB)
+    if not 1 <= args.native_ready_timeout_seconds <= 600:
+        ap.error("native-ready-timeout-seconds must be 1..600")
     trials = plan_trials(args.blocks, args.warm_repeats, args.seed)
     summary = {"status": "DRY_RUN" if not args.execute else "EXECUTING",
                "model": args.model, "warm_repeats_per_block": args.warm_repeats,
@@ -250,6 +320,7 @@ def main(argv=None):
                "sample_schedule": [{"block": b, "repetition": i, "engine": e}
                                    for b, i, e in trials],
                "min_available_mib": args.min_available_mib,
+               "native_ready_timeout_seconds": args.native_ready_timeout_seconds,
                "template_mode": "raw_prompts",
                "native_note": "Verify router's --threads=4 --models-max=1 independently."}
     if not args.execute:
@@ -262,12 +333,15 @@ def main(argv=None):
     if not args.output or not os.path.isabs(args.output):
         ap.error("exclusive absolute private receipt path is required")
     require_headroom(args.min_available_mib)
+    readiness = wait_native_ready(args.native_ready_timeout_seconds,
+                                  args.min_available_mib)
     verified_model_bytes = verify_pinned_blob(args.model, args.gguf_sha256)
     fd = os.open(args.output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         with os.fdopen(fd, "w") as receipt:
             header = dict(summary, status="STARTED", model_sha256=args.gguf_sha256,
                           model_blob_verified=True, model_blob_bytes=verified_model_bytes,
+                          native_readiness=readiness,
                           uid=os.getuid(), host=platform.node(), python=sys.version.split()[0],
                           recorded_epoch=time.time(), endpoints=["127.0.0.1:11434", "127.0.0.1:18086"])
             receipt.write(json.dumps(header, sort_keys=True) + "\n")
