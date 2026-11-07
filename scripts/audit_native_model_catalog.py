@@ -13,10 +13,15 @@ import re
 import stat
 import sys
 from urllib.parse import urlparse
-from urllib.request import urlopen
+from urllib.request import build_opener, HTTPRedirectHandler, ProxyHandler
 
 BLOB = re.compile(r"^(?:sha256:|sha256-)([0-9a-f]{64})$")
 MODEL_LAYER = "application/vnd.ollama.image.model"
+
+
+class RejectRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 
 def sha(value):
@@ -54,15 +59,20 @@ def list_manifests(root):
             rel = file_path.relative_to(manifests).parts
             if len(rel) != 4:
                 continue
-            _, namespace, model, tag = rel
-            alias = (model if namespace == "library" else namespace + "/" + model) + ":" + tag
+            registry, namespace, model, tag = rel
+            if registry.lower() != "registry.ollama.ai":
+                alias = registry + "/" + namespace + "/" + model + ":" + tag
+            elif namespace.lower() != "library":
+                alias = namespace + "/" + model + ":" + tag
+            else:
+                alias = model + ":" + tag
             try:
                 with file_path.open(encoding="utf-8") as stream:
                     digest = manifest_model_blob(json.load(stream))
             except (OSError, ValueError, UnicodeError):
                 digest = None
             blob = root / "blobs" / ("sha256-" + digest) if digest else None
-            result[alias] = digest if blob and regular_file(blob) else None
+            result[alias] = digest if blob and not (root / "blobs").is_symlink() and regular_file(blob) else None
     return result
 
 
@@ -77,7 +87,7 @@ def native_model_blob(item, root):
     path = Path(argv[idx + 1])
     digest = sha(path.name)
     expected = root / "blobs" / ("sha256-" + digest) if digest else None
-    if not expected or path != expected:
+    if not expected or path != expected or (root / "blobs").is_symlink():
         return None, "noncanonical_native_model_path"
     if not regular_file(path):
         return None, "missing_native_blob"
@@ -131,7 +141,8 @@ def fetch_local(base, path):
     parsed = urlparse(base)
     if parsed.scheme != "http" or parsed.hostname not in ("localhost", "127.0.0.1", "::1"):
         raise ValueError("Only loopback catalog endpoints are authorised")
-    with urlopen(base.rstrip("/") + path, timeout=8) as response:
+    opener = build_opener(ProxyHandler({}), RejectRedirect())
+    with opener.open(base.rstrip("/") + path, timeout=8) as response:
         if response.status != 200:
             raise RuntimeError("Catalog endpoint returned non-200")
         return json.load(response)
@@ -149,6 +160,12 @@ def selftest(test_root):
         manifest = root / "manifests" / "registry.ollama.ai" / "library" / "tiny" / "latest"
         manifest.parent.mkdir(parents=True)
         manifest.write_text(json.dumps({"layers": [{"mediaType": MODEL_LAYER, "digest": "sha256:" + digest}]}))
+        other_registry = root / "manifests" / "mirror.example.net" / "library" / "tiny" / "latest"
+        other_registry.parent.mkdir(parents=True)
+        other_registry.write_text(json.dumps({"layers": [{"mediaType": MODEL_LAYER, "digest": "sha256:" + "b" * 64}]}))
+        (root / "blobs" / ("sha256-" + "b" * 64)).write_bytes(b"other registry fixture")
+        assert list_manifests(root)["mirror.example.net/library/tiny:latest"] == "b" * 64
+        assert list_manifests(root)["tiny:latest"] == digest
         tags = {"models": [{"name": "tiny:latest"}, {"name": "unresolved:latest"}]}
         models = {"data": [
             {"id": "TINY", "status": {"args": ["--model", str(root / "blobs" / ("sha256-" + digest))]}},
@@ -164,6 +181,17 @@ def selftest(test_root):
             "unresolved_ollama": 1, "unresolved_native": 2, "missing_native_blobs": 1,
         }
         assert next(x for x in result["native"] if x["alias"] == "TINY")["ollama_aliases_with_identical_weights"] == ["tiny:latest"]
+        assert RejectRedirect().redirect_request(None, None, 302, "redirect", {}, "http://external.invalid/") is None
+        # A symlinked blob root is never admissible, even when its final file is regular.
+        linked_root = root / "other_root"
+        linked_root.mkdir()
+        try:
+            (linked_root / "blobs").symlink_to(root / "blobs", target_is_directory=True)
+        except (NotImplementedError, OSError):
+            pass
+        else:
+            linked_alias = {"status": {"args": ["--model", str(linked_root / "blobs" / ("sha256-" + digest))]}}
+            assert native_model_blob(linked_alias, linked_root) == (None, "noncanonical_native_model_path")
         assert manifest_model_blob({"layers": [
             {"mediaType": MODEL_LAYER, "digest": "sha256:" + digest},
             {"mediaType": MODEL_LAYER, "digest": "sha256:" + "b" * 64},
