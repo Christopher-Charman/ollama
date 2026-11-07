@@ -106,6 +106,7 @@ def measure(engine, model):
         "ttft_ms": ttft, "generated_tokens": gen,
         "generation_tps": round(gen * 1000.0 / decode_ms, 3) if decode_ms else None,
         "prompt_tokens": final.get("prompt_eval_count") if engine == "ollama" else timings.get("prompt_n"),
+        "ollama_load_ms": round(final.get("load_duration", 0) / 1000000.0, 3) if engine == "ollama" else None,
         "output_sha256": hashlib.sha256(output.encode("utf-8")).hexdigest(),
         "meminfo_after_kib": memory_kib(),
         "complete": True
@@ -122,8 +123,32 @@ def plan_order(blocks, seed):
     return order
 
 
+def plan_trials(blocks, warm_repeats, seed):
+    """Interleave engines at every repetition to reduce order/cache bias.
+
+    A block has one first request per engine and warm_repeats additional
+    requests per engine. The first request is not necessarily a cold load:
+    another client may already have the model resident.
+    """
+    rng = random.Random(seed)
+    trials = []
+    for block in range(blocks):
+        for repetition in range(warm_repeats + 1):
+            pair = ["ollama", "native"]
+            rng.shuffle(pair)
+            for engine in pair:
+                trials.append((block, repetition, engine))
+    return trials
+
+
 def selftest():
     assert len(plan_order(4, 42)) == 8
+    trials = plan_trials(2, 5, 42)
+    assert trials == plan_trials(2, 5, 42)
+    assert len(trials) == 24
+    assert all(sum(1 for b, r, e in trials if b == block and r == rep and e == engine) == 1
+               for block in range(2) for rep in range(6)
+               for engine in ("ollama", "native"))
     assert plan_order(4, 42) == plan_order(4, 42)
     assert payload("ollama", ALLOWED[0])["options"]["num_ctx"] == 4096
     assert payload("native", ALLOWED[0])["cache_prompt"] is False
@@ -200,10 +225,13 @@ def main(argv=None):
         ap.error("warm-repeats must be 5..30 and blocks 1..10")
     if args.min_available_mib < 4096:
         ap.error("minimum available memory may not be less than 4096 MiB")
-    order = plan_order(args.blocks, args.seed)
+    trials = plan_trials(args.blocks, args.warm_repeats, args.seed)
     summary = {"status": "DRY_RUN" if not args.execute else "EXECUTING",
-               "model": args.model, "warm_repeats": args.warm_repeats,
-               "block_order": order, "min_available_mib": args.min_available_mib,
+               "model": args.model, "warm_repeats_per_block": args.warm_repeats,
+               "blocks": args.blocks, "sample_count": len(trials),
+               "sample_schedule": [{"block": b, "repetition": i, "engine": e}
+                                   for b, i, e in trials],
+               "min_available_mib": args.min_available_mib,
                "template_mode": "raw_prompts",
                "native_note": "Verify router's --threads=4 --models-max=1 independently."}
     if not args.execute:
@@ -225,18 +253,18 @@ def main(argv=None):
                           uid=os.getuid(), host=platform.node(), python=sys.version.split()[0],
                           recorded_epoch=time.time(), endpoints=["127.0.0.1:11434", "127.0.0.1:18086"])
             receipt.write(json.dumps(header, sort_keys=True) + "\n")
-            for engine in order:
-                for i in range(args.warm_repeats + 1):
-                    before = require_headroom(args.min_available_mib)
-                    measured = measure(engine, args.model)
-                    if measured["meminfo_after_kib"].get("MemAvailable", 0) < args.min_available_mib * 1024:
-                        raise RuntimeError("MEMORY_HEADROOM_BELOW_GATE_AFTER_REQUEST")
-                    measured.update({"phase": "load_or_cold" if i == 0 else "warm",
-                                     "meminfo_before_kib": before,
-                                     "block_engine": engine})
-                    receipt.write(json.dumps(measured, sort_keys=True) + "\n")
-                    receipt.flush()
-                    os.fsync(receipt.fileno())
+            for block, repetition, engine in trials:
+                before = require_headroom(args.min_available_mib)
+                measured = measure(engine, args.model)
+                if measured["meminfo_after_kib"].get("MemAvailable", 0) < args.min_available_mib * 1024:
+                    raise RuntimeError("MEMORY_HEADROOM_BELOW_GATE_AFTER_REQUEST")
+                measured.update({"phase": "first_in_block" if repetition == 0 else "warm",
+                                 "block": block, "repetition": repetition,
+                                 "meminfo_before_kib": before,
+                                 "block_engine": engine})
+                receipt.write(json.dumps(measured, sort_keys=True) + "\n")
+                receipt.flush()
+                os.fsync(receipt.fileno())
             if verify_pinned_blob(args.model, args.gguf_sha256) != verified_model_bytes:
                 raise RuntimeError("MODEL_IDENTITY_CHANGED_DURING_BENCHMARK")
             receipt.write(json.dumps({"status": "DONE"}) + "\n")
