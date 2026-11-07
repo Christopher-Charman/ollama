@@ -170,7 +170,7 @@ def selftest(test_root):
         models = {"data": [
             {"id": "TINY", "status": {"args": ["--model", str(root / "blobs" / ("sha256-" + digest))]}},
             {"id": "OTHER_HOST", "status": {"args": ["--model", "/another/root/blobs/sha256-" + digest]}},
-            {"id": "INVALID", "status": {"args": ["--model", str(root / "blobs" / ("sha256-" + "b" * 64))]}},
+            {"id": "INVALID", "status": {"args": ["--model", str(root / "blobs" / ("sha256-" + "c" * 64))]}},
         ]}
         result = reconcile(tags, models, list_manifests(root), root)
         assert result["summary"] == {
