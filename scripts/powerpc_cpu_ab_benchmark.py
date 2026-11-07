@@ -7,6 +7,7 @@ OpenWebUI provider, binaries, model files, or Ollama API configuration.
 """
 import argparse
 import hashlib
+import http.client
 import io
 import json
 import os
@@ -15,10 +16,14 @@ import random
 import re
 import sys
 import time
+import urllib.error
 import urllib.request
+import urllib.parse
 
 OLLAMA = "http://127.0.0.1:11434/api/generate"
 NATIVE = "http://127.0.0.1:18086/completion"
+NATIVE_HEALTH = "http://127.0.0.1:18086/health"
+MEMORY_FLOOR_MIB = 4608
 ALLOWED = ("gemma3:270m-core", "qwen2.5-coder:1.5b-instruct-q4_K_M")
 PROMPT = "Explain in two sentences how a checksum detects changes to a file."
 REQ_TOKENS = 48
@@ -40,6 +45,43 @@ def require_headroom(min_mib):
         raise RuntimeError("MEMORY_HEADROOM_BELOW_GATE: available MiB=%d; required=%d" %
                            (values.get("MemAvailable", 0) // 1024, min_mib))
     return values
+
+
+def wait_native_ready(timeout_seconds, min_mib, *,
+                      opener=urllib.request.urlopen,
+                      clock=time.monotonic, sleep=time.sleep,
+                      check_headroom=None):
+    """Accept HTTP 200 only inside the bounded readiness period."""
+    if check_headroom is None:
+        check_headroom = lambda: require_headroom(min_mib)
+    started = clock()
+    counts = {}
+    while True:
+        remaining = timeout_seconds - (clock() - started)
+        if remaining <= 0:
+            raise RuntimeError("NATIVE_READINESS_TIMEOUT")
+        check_headroom()
+        remaining = timeout_seconds - (clock() - started)
+        if remaining <= 0:
+            raise RuntimeError("NATIVE_READINESS_TIMEOUT")
+        try:
+            with opener(NATIVE_HEALTH, timeout=min(5, remaining)) as response:
+                status = response.status
+        except urllib.error.HTTPError as error:
+            status = error.code
+            error.close()
+        except urllib.error.URLError:
+            status = 0
+        elapsed = clock() - started
+        if elapsed >= timeout_seconds:
+            raise RuntimeError("NATIVE_READINESS_TIMEOUT")
+        counts[status] = counts.get(status, 0) + 1
+        if status == 200:
+            return {"wait_ms": round(elapsed * 1000, 3),
+                    "status_counts": counts}
+        if status not in (0, 503):
+            raise RuntimeError("NATIVE_READINESS_UNEXPECTED_HTTP_%s" % status)
+        sleep(min(1, timeout_seconds - elapsed))
 
 
 def payload(engine, model):
@@ -99,13 +141,116 @@ def prompt_stats(engine, final):
     return tokens, ms, tps
 
 
-def measure(engine, model):
+class _NativeStream:
+    """Own the direct HTTP socket so the post-header read budget is independent."""
+
+    def __init__(self, connection, response, socket):
+        self._connection = connection
+        self._response = response
+        self._socket = socket
+        self.status = response.status
+
+    def restore_read_timeout(self, seconds):
+        self._socket.settimeout(seconds)
+
+    def __iter__(self):
+        return iter(self._response)
+
+    def close(self):
+        try:
+            self._response.close()
+        finally:
+            self._connection.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+
+def _open_native_stream(request, timeout):
+    """Bound connect/headers using public HTTPConnection APIs, not body reads."""
+    parsed = urllib.parse.urlsplit(request.full_url)
+    if parsed.scheme != "http" or parsed.hostname != "127.0.0.1":
+        raise RuntimeError("NATIVE_COMPLETION_ENDPOINT_NOT_LOOPBACK_HTTP")
+    connection = http.client.HTTPConnection(parsed.hostname, parsed.port,
+                                            timeout=timeout)
+    try:
+        path = parsed.path or "/"
+        if parsed.query:
+            path += "?" + parsed.query
+        connection.request(request.get_method(), path, body=request.data,
+                           headers=dict(request.header_items()))
+        socket = connection.sock
+        if socket is None:
+            raise RuntimeError("NATIVE_COMPLETION_SOCKET_MISSING")
+        response = connection.getresponse()
+        if response.status != 200:
+            status, reason, headers = response.status, response.reason, response.headers
+            response.close()
+            raise urllib.error.HTTPError(request.full_url, status, reason, headers, None)
+        return _NativeStream(connection, response, socket)
+    except BaseException:
+        connection.close()
+        raise
+
+
+def open_native_completion_when_ready(request, timeout_seconds, min_mib, *,
+                                      opener=_open_native_stream,
+                                      clock=time.monotonic, sleep=time.sleep,
+                                      check_headroom=None):
+    """Retry only pre-stream 503; restore 110s socket reads after HTTP 200."""
+    if check_headroom is None:
+        check_headroom = lambda: require_headroom(min_mib)
+    started = clock()
+    retries = 0
+    while True:
+        remaining = timeout_seconds - (clock() - started)
+        if remaining <= 0:
+            raise RuntimeError("NATIVE_COMPLETION_LOADING_TIMEOUT")
+        check_headroom()
+        remaining = timeout_seconds - (clock() - started)
+        if remaining <= 0:
+            raise RuntimeError("NATIVE_COMPLETION_LOADING_TIMEOUT")
+        try:
+            stream = opener(request, timeout=min(110, remaining))
+        except urllib.error.HTTPError as error:
+            status = error.code
+            error.close()
+            if status != 503:
+                raise
+            retries += 1
+            remaining = timeout_seconds - (clock() - started)
+            if remaining <= 0:
+                raise RuntimeError("NATIVE_COMPLETION_LOADING_TIMEOUT")
+            sleep(min(1, remaining))
+            continue
+        if clock() - started >= timeout_seconds:
+            stream.close()
+            raise RuntimeError("NATIVE_COMPLETION_LOADING_TIMEOUT")
+        try:
+            stream.restore_read_timeout(110)
+        except BaseException:
+            stream.close()
+            raise
+        return stream, retries
+
+
+def measure(engine, model, *, native_ready_timeout_seconds=180,
+            min_available_mib=MEMORY_FLOOR_MIB):
     obj = payload(engine, model)
     url = OLLAMA if engine == "ollama" else NATIVE
     req = urllib.request.Request(url, json.dumps(obj).encode("utf-8"),
                                  {"Content-Type": "application/json"})
     started = time.monotonic()
-    with urllib.request.urlopen(req, timeout=110) as stream:
+    if engine == "native":
+        stream, loading_retries = open_native_completion_when_ready(
+            req, native_ready_timeout_seconds, min_available_mib)
+    else:
+        stream = urllib.request.urlopen(req, timeout=110)
+        loading_retries = None
+    with stream:
         if stream.status != 200:
             raise RuntimeError("NON_200_HTTP")
         ttft, output, final = decode_stream(engine, stream, started)
@@ -118,6 +263,7 @@ def measure(engine, model):
     return {
         "engine": engine, "model": model, "wall_ms": elapsed,
         "ttft_ms": ttft, "generated_tokens": gen,
+        "native_loading_503_retries": loading_retries,
         "generation_tps": round(gen * 1000.0 / decode_ms, 3) if decode_ms else None,
         "prompt_tokens": prompt_tokens, "prompt_eval_ms": prompt_ms,
         "prompt_eval_tps": prompt_tps,
@@ -170,6 +316,88 @@ def selftest():
     assert prompt_stats("ollama", {"prompt_eval_count": 14, "prompt_eval_duration": 140000000}) == (14, 140.0, 100.0)
     assert prompt_stats("native", {"timings": {"prompt_n": 14, "prompt_ms": 70}}) == (14, 70.0, 200.0)
     assert prompt_stats("native", {"timings": {}}) == (None, None, None)
+    # The candidate emits 503 while loading. Poll until 200; never retry a
+    # partially streamed inference, and reject a real server error.
+    class HealthyResponse:
+        status = 200
+        def __enter__(self):
+            return self
+        def __exit__(self, *_):
+            return False
+        def close(self):
+            self.closed = True
+        def restore_read_timeout(self, seconds):
+            self.read_timeout = seconds
+    codes = iter((503, 503, 200))
+    def loading_opener(url, timeout):
+        assert url == NATIVE_HEALTH and 0 < timeout <= 5
+        code = next(codes)
+        if code == 503:
+            raise urllib.error.HTTPError(url, 503, "loading", None, None)
+        return HealthyResponse()
+    proof = wait_native_ready(5, MEMORY_FLOOR_MIB,
+                              opener=loading_opener, sleep=lambda _: None,
+                              check_headroom=lambda: None)
+    assert proof["status_counts"] == {503: 2, 200: 1}
+    def broken_opener(url, timeout):
+        raise urllib.error.HTTPError(url, 500, "failure", None, None)
+    try:
+        wait_native_ready(5, MEMORY_FLOOR_MIB, opener=broken_opener,
+                          sleep=lambda _: None, check_headroom=lambda: None)
+    except RuntimeError as error:
+        assert str(error) == "NATIVE_READINESS_UNEXPECTED_HTTP_500"
+    else:
+        raise AssertionError("non-loading HTTP 500 must fail")
+    requests_seen = []
+    response_codes = iter((503, 200))
+    def pre_stream_opener(request, timeout):
+        assert 0 < timeout <= 110
+        requests_seen.append(request)
+        code = next(response_codes)
+        if code == 503:
+            raise urllib.error.HTTPError(NATIVE, 503, "loading", None, None)
+        return HealthyResponse()
+    stream, retries = open_native_completion_when_ready(
+        object(), 5, MEMORY_FLOOR_MIB, opener=pre_stream_opener,
+        sleep=lambda _: None, check_headroom=lambda: None)
+    assert stream.status == 200 and retries == 1 and len(requests_seen) == 2
+    assert stream.read_timeout == 110
+    try:
+        open_native_completion_when_ready(
+            object(), 5, MEMORY_FLOOR_MIB, opener=broken_opener,
+            sleep=lambda _: None, check_headroom=lambda: None)
+    except urllib.error.HTTPError as error:
+        assert error.code == 500
+    else:
+        raise AssertionError("unexpected completion HTTP 500 must fail")
+    # A slow HTTP 200 must never succeed after the readiness deadline.
+    simulated = [0.0]
+    def late_health(url, timeout):
+        assert 0 < timeout <= 1
+        simulated[0] = 2.0
+        return HealthyResponse()
+    try:
+        wait_native_ready(1, MEMORY_FLOOR_MIB, opener=late_health,
+                          clock=lambda: simulated[0], sleep=lambda _: None,
+                          check_headroom=lambda: None)
+    except RuntimeError as error:
+        assert str(error) == "NATIVE_READINESS_TIMEOUT"
+    else:
+        raise AssertionError("late HTTP 200 must not pass")
+    simulated[0] = 0.0
+    def late_completion(request, timeout):
+        assert 0 < timeout <= 1
+        simulated[0] = 2.0
+        return HealthyResponse()
+    try:
+        open_native_completion_when_ready(
+            object(), 1, MEMORY_FLOOR_MIB, opener=late_completion,
+            clock=lambda: simulated[0], sleep=lambda _: None,
+            check_headroom=lambda: None)
+    except RuntimeError as error:
+        assert str(error) == "NATIVE_COMPLETION_LOADING_TIMEOUT"
+    else:
+        raise AssertionError("late HTTP 200 completion must not pass")
     fake_o = [b'{"response":"OK","done":false}\n',
               b'{"response":"","done":true,"eval_count":1,"eval_duration":1000000000}\n']
     fake_n = [b'data: {"content":"OK","stop":false}\n',
@@ -231,7 +459,8 @@ def main(argv=None):
     ap.add_argument("--warm-repeats", type=int, default=7)
     ap.add_argument("--blocks", type=int, default=2)
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--min-available-mib", type=int, default=4608)
+    ap.add_argument("--min-available-mib", type=int, default=MEMORY_FLOOR_MIB)
+    ap.add_argument("--native-ready-timeout-seconds", type=int, default=180)
     ap.add_argument("--expected-uid", type=int)
     ap.add_argument("--gguf-sha256")
     ap.add_argument("--output")
@@ -241,8 +470,11 @@ def main(argv=None):
         return 0
     if not 5 <= args.warm_repeats <= 30 or not 1 <= args.blocks <= 10:
         ap.error("warm-repeats must be 5..30 and blocks 1..10")
-    if args.min_available_mib < 4096:
-        ap.error("minimum available memory may not be less than 4096 MiB")
+    if args.min_available_mib < MEMORY_FLOOR_MIB:
+        ap.error("minimum available memory may not be less than %d MiB" %
+                 MEMORY_FLOOR_MIB)
+    if not 1 <= args.native_ready_timeout_seconds <= 600:
+        ap.error("native-ready-timeout-seconds must be 1..600")
     trials = plan_trials(args.blocks, args.warm_repeats, args.seed)
     summary = {"status": "DRY_RUN" if not args.execute else "EXECUTING",
                "model": args.model, "warm_repeats_per_block": args.warm_repeats,
@@ -250,6 +482,7 @@ def main(argv=None):
                "sample_schedule": [{"block": b, "repetition": i, "engine": e}
                                    for b, i, e in trials],
                "min_available_mib": args.min_available_mib,
+               "native_ready_timeout_seconds": args.native_ready_timeout_seconds,
                "template_mode": "raw_prompts",
                "native_note": "Verify router's --threads=4 --models-max=1 independently."}
     if not args.execute:
@@ -262,18 +495,23 @@ def main(argv=None):
     if not args.output or not os.path.isabs(args.output):
         ap.error("exclusive absolute private receipt path is required")
     require_headroom(args.min_available_mib)
+    readiness = wait_native_ready(args.native_ready_timeout_seconds,
+                                  args.min_available_mib)
     verified_model_bytes = verify_pinned_blob(args.model, args.gguf_sha256)
     fd = os.open(args.output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         with os.fdopen(fd, "w") as receipt:
             header = dict(summary, status="STARTED", model_sha256=args.gguf_sha256,
                           model_blob_verified=True, model_blob_bytes=verified_model_bytes,
+                          native_readiness=readiness,
                           uid=os.getuid(), host=platform.node(), python=sys.version.split()[0],
                           recorded_epoch=time.time(), endpoints=["127.0.0.1:11434", "127.0.0.1:18086"])
             receipt.write(json.dumps(header, sort_keys=True) + "\n")
             for block, repetition, engine in trials:
                 before = require_headroom(args.min_available_mib)
-                measured = measure(engine, args.model)
+                measured = measure(engine, args.model,
+                                   native_ready_timeout_seconds=args.native_ready_timeout_seconds,
+                                   min_available_mib=args.min_available_mib)
                 if measured["meminfo_after_kib"].get("MemAvailable", 0) < args.min_available_mib * 1024:
                     raise RuntimeError("MEMORY_HEADROOM_BELOW_GATE_AFTER_REQUEST")
                 measured.update({"phase": "first_in_block" if repetition == 0 else "warm",
