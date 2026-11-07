@@ -86,6 +86,19 @@ def decode_stream(engine, lines, started, clock=time.monotonic):
     return ttft, "".join(chunks), final
 
 
+def prompt_stats(engine, final):
+    """Return measured prompt tokens, prompt-evaluation ms and prompt throughput."""
+    timing = final if engine == "ollama" else final.get("timings", {})
+    tokens = final.get("prompt_eval_count") if engine == "ollama" else timing.get("prompt_n")
+    duration = (timing.get("prompt_eval_duration", 0) / 1000000.0
+                if engine == "ollama" else timing.get("prompt_ms", 0))
+    if not isinstance(duration, (float, int)) or duration <= 0:
+        return tokens, None, None
+    ms = round(duration, 3)
+    tps = round(tokens * 1000.0 / duration, 3) if isinstance(tokens, (float, int)) and tokens > 0 else None
+    return tokens, ms, tps
+
+
 def measure(engine, model):
     obj = payload(engine, model)
     url = OLLAMA if engine == "ollama" else NATIVE
@@ -101,11 +114,13 @@ def measure(engine, model):
     gen = final.get("eval_count", 0) if engine == "ollama" else timings.get("predicted_n", 0)
     decode_ms = (final.get("eval_duration", 0) / 1000000.0 if engine == "ollama"
                  else timings.get("predicted_ms", 0))
+    prompt_tokens, prompt_ms, prompt_tps = prompt_stats(engine, final)
     return {
         "engine": engine, "model": model, "wall_ms": elapsed,
         "ttft_ms": ttft, "generated_tokens": gen,
         "generation_tps": round(gen * 1000.0 / decode_ms, 3) if decode_ms else None,
-        "prompt_tokens": final.get("prompt_eval_count") if engine == "ollama" else timings.get("prompt_n"),
+        "prompt_tokens": prompt_tokens, "prompt_eval_ms": prompt_ms,
+        "prompt_eval_tps": prompt_tps,
         "ollama_load_ms": round(final.get("load_duration", 0) / 1000000.0, 3) if engine == "ollama" else None,
         "output_sha256": hashlib.sha256(output.encode("utf-8")).hexdigest(),
         "meminfo_after_kib": memory_kib(),
@@ -152,6 +167,9 @@ def selftest():
     assert plan_order(4, 42) == plan_order(4, 42)
     assert payload("ollama", ALLOWED[0])["options"]["num_ctx"] == 4096
     assert payload("native", ALLOWED[0])["cache_prompt"] is False
+    assert prompt_stats("ollama", {"prompt_eval_count": 14, "prompt_eval_duration": 140000000}) == (14, 140.0, 100.0)
+    assert prompt_stats("native", {"timings": {"prompt_n": 14, "prompt_ms": 70}}) == (14, 70.0, 200.0)
+    assert prompt_stats("native", {"timings": {}}) == (None, None, None)
     fake_o = [b'{"response":"OK","done":false}\n',
               b'{"response":"","done":true,"eval_count":1,"eval_duration":1000000000}\n']
     fake_n = [b'data: {"content":"OK","stop":false}\n',
