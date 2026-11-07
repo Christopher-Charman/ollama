@@ -7,6 +7,7 @@ OpenWebUI provider, binaries, model files, or Ollama API configuration.
 """
 import argparse
 import hashlib
+import http.client
 import io
 import json
 import os
@@ -17,6 +18,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import urllib.parse
 
 OLLAMA = "http://127.0.0.1:11434/api/generate"
 NATIVE = "http://127.0.0.1:18086/completion"
@@ -139,11 +141,66 @@ def prompt_stats(engine, final):
     return tokens, ms, tps
 
 
+class _NativeStream:
+    """Own the direct HTTP socket so the post-header read budget is independent."""
+
+    def __init__(self, connection, response, socket):
+        self._connection = connection
+        self._response = response
+        self._socket = socket
+        self.status = response.status
+
+    def restore_read_timeout(self, seconds):
+        self._socket.settimeout(seconds)
+
+    def __iter__(self):
+        return iter(self._response)
+
+    def close(self):
+        try:
+            self._response.close()
+        finally:
+            self._connection.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+
+def _open_native_stream(request, timeout):
+    """Bound connect/headers using public HTTPConnection APIs, not body reads."""
+    parsed = urllib.parse.urlsplit(request.full_url)
+    if parsed.scheme != "http" or parsed.hostname != "127.0.0.1":
+        raise RuntimeError("NATIVE_COMPLETION_ENDPOINT_NOT_LOOPBACK_HTTP")
+    connection = http.client.HTTPConnection(parsed.hostname, parsed.port,
+                                            timeout=timeout)
+    try:
+        path = parsed.path or "/"
+        if parsed.query:
+            path += "?" + parsed.query
+        connection.request(request.get_method(), path, body=request.data,
+                           headers=dict(request.header_items()))
+        socket = connection.sock
+        if socket is None:
+            raise RuntimeError("NATIVE_COMPLETION_SOCKET_MISSING")
+        response = connection.getresponse()
+        if response.status != 200:
+            status, reason, headers = response.status, response.reason, response.headers
+            response.close()
+            raise urllib.error.HTTPError(request.full_url, status, reason, headers, None)
+        return _NativeStream(connection, response, socket)
+    except BaseException:
+        connection.close()
+        raise
+
+
 def open_native_completion_when_ready(request, timeout_seconds, min_mib, *,
-                                      opener=urllib.request.urlopen,
+                                      opener=_open_native_stream,
                                       clock=time.monotonic, sleep=time.sleep,
                                       check_headroom=None):
-    """Retry only pre-stream 503; loading timeout does not bound inference."""
+    """Retry only pre-stream 503; restore 110s socket reads after HTTP 200."""
     if check_headroom is None:
         check_headroom = lambda: require_headroom(min_mib)
     started = clock()
@@ -172,6 +229,11 @@ def open_native_completion_when_ready(request, timeout_seconds, min_mib, *,
         if clock() - started >= timeout_seconds:
             stream.close()
             raise RuntimeError("NATIVE_COMPLETION_LOADING_TIMEOUT")
+        try:
+            stream.restore_read_timeout(110)
+        except BaseException:
+            stream.close()
+            raise
         return stream, retries
 
 
@@ -264,6 +326,8 @@ def selftest():
             return False
         def close(self):
             self.closed = True
+        def restore_read_timeout(self, seconds):
+            self.read_timeout = seconds
     codes = iter((503, 503, 200))
     def loading_opener(url, timeout):
         assert url == NATIVE_HEALTH and 0 < timeout <= 5
@@ -297,6 +361,7 @@ def selftest():
         object(), 5, MEMORY_FLOOR_MIB, opener=pre_stream_opener,
         sleep=lambda _: None, check_headroom=lambda: None)
     assert stream.status == 200 and retries == 1 and len(requests_seen) == 2
+    assert stream.read_timeout == 110
     try:
         open_native_completion_when_ready(
             object(), 5, MEMORY_FLOOR_MIB, opener=broken_opener,
