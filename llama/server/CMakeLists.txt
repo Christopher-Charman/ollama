@@ -186,6 +186,14 @@ FetchContent_Declare(
     ${_ollama_compat_patch_cmd}
 )
 FetchContent_MakeAvailable(llama_cpp)
+# The ggml OpenMP runtime is a private dependency of shared CPU libraries.
+# With --no-copy-dt-needed-entries, GNU ld does not resolve those references
+# from transitive shared dependencies at the final llama-server link step.
+# Explicitly propagate CMake's portable OpenMP target only for opt-in builds.
+if(GGML_OPENMP AND TARGET llama-server)
+    find_package(OpenMP REQUIRED COMPONENTS CXX)
+    target_link_libraries(llama-server PRIVATE OpenMP::OpenMP_CXX)
+endif()
 target_sources(server-context PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../clef/clef.cpp)
 target_include_directories(server-context PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../clef)
 
