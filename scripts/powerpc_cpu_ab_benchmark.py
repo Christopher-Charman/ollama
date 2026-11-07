@@ -49,35 +49,37 @@ def wait_native_ready(timeout_seconds, min_mib, *,
                       opener=urllib.request.urlopen,
                       clock=time.monotonic, sleep=time.sleep,
                       check_headroom=None):
-    """Treat HTTP 503 as model loading, not a failed inference sample.
-
-    Only local host readiness is probed; this never retries a partly streamed
-    inference request, changes provider state, or evicts another model.
-    """
+    """Accept HTTP 200 only inside the bounded readiness period."""
     if check_headroom is None:
         check_headroom = lambda: require_headroom(min_mib)
     started = clock()
-    status_counts = {}
+    counts = {}
     while True:
+        remaining = timeout_seconds - (clock() - started)
+        if remaining <= 0:
+            raise RuntimeError("NATIVE_READINESS_TIMEOUT")
         check_headroom()
+        remaining = timeout_seconds - (clock() - started)
+        if remaining <= 0:
+            raise RuntimeError("NATIVE_READINESS_TIMEOUT")
         try:
-            with opener(NATIVE_HEALTH, timeout=5) as response:
+            with opener(NATIVE_HEALTH, timeout=min(5, remaining)) as response:
                 status = response.status
         except urllib.error.HTTPError as error:
             status = error.code
             error.close()
         except urllib.error.URLError:
             status = 0
-        status_counts[status] = status_counts.get(status, 0) + 1
+        elapsed = clock() - started
+        if elapsed >= timeout_seconds:
+            raise RuntimeError("NATIVE_READINESS_TIMEOUT")
+        counts[status] = counts.get(status, 0) + 1
         if status == 200:
-            return {"wait_ms": round((clock() - started) * 1000, 3),
-                    "status_counts": status_counts}
+            return {"wait_ms": round(elapsed * 1000, 3),
+                    "status_counts": counts}
         if status not in (0, 503):
             raise RuntimeError("NATIVE_READINESS_UNEXPECTED_HTTP_%s" % status)
-        remaining = timeout_seconds - (clock() - started)
-        if remaining <= 0:
-            raise RuntimeError("NATIVE_READINESS_TIMEOUT")
-        sleep(min(1, remaining))
+        sleep(min(1, timeout_seconds - elapsed))
 
 
 def payload(engine, model):
@@ -141,25 +143,36 @@ def open_native_completion_when_ready(request, timeout_seconds, min_mib, *,
                                       opener=urllib.request.urlopen,
                                       clock=time.monotonic, sleep=time.sleep,
                                       check_headroom=None):
-    """Retry only HTTP 503 received before any inference stream exists."""
+    """Retry only pre-stream 503; loading timeout does not bound inference."""
     if check_headroom is None:
         check_headroom = lambda: require_headroom(min_mib)
     started = clock()
-    loading_retries = 0
+    retries = 0
     while True:
+        remaining = timeout_seconds - (clock() - started)
+        if remaining <= 0:
+            raise RuntimeError("NATIVE_COMPLETION_LOADING_TIMEOUT")
         check_headroom()
+        remaining = timeout_seconds - (clock() - started)
+        if remaining <= 0:
+            raise RuntimeError("NATIVE_COMPLETION_LOADING_TIMEOUT")
         try:
-            return opener(request, timeout=110), loading_retries
+            stream = opener(request, timeout=min(110, remaining))
         except urllib.error.HTTPError as error:
             status = error.code
             error.close()
             if status != 503:
                 raise
-            loading_retries += 1
+            retries += 1
             remaining = timeout_seconds - (clock() - started)
             if remaining <= 0:
                 raise RuntimeError("NATIVE_COMPLETION_LOADING_TIMEOUT")
             sleep(min(1, remaining))
+            continue
+        if clock() - started >= timeout_seconds:
+            stream.close()
+            raise RuntimeError("NATIVE_COMPLETION_LOADING_TIMEOUT")
+        return stream, retries
 
 
 def measure(engine, model, *, native_ready_timeout_seconds=180,
@@ -249,9 +262,11 @@ def selftest():
             return self
         def __exit__(self, *_):
             return False
+        def close(self):
+            self.closed = True
     codes = iter((503, 503, 200))
     def loading_opener(url, timeout):
-        assert url == NATIVE_HEALTH and timeout == 5
+        assert url == NATIVE_HEALTH and 0 < timeout <= 5
         code = next(codes)
         if code == 503:
             raise urllib.error.HTTPError(url, 503, "loading", None, None)
@@ -272,7 +287,7 @@ def selftest():
     requests_seen = []
     response_codes = iter((503, 200))
     def pre_stream_opener(request, timeout):
-        assert timeout == 110
+        assert 0 < timeout <= 110
         requests_seen.append(request)
         code = next(response_codes)
         if code == 503:
@@ -290,6 +305,34 @@ def selftest():
         assert error.code == 500
     else:
         raise AssertionError("unexpected completion HTTP 500 must fail")
+    # A slow HTTP 200 must never succeed after the readiness deadline.
+    simulated = [0.0]
+    def late_health(url, timeout):
+        assert 0 < timeout <= 1
+        simulated[0] = 2.0
+        return HealthyResponse()
+    try:
+        wait_native_ready(1, MEMORY_FLOOR_MIB, opener=late_health,
+                          clock=lambda: simulated[0], sleep=lambda _: None,
+                          check_headroom=lambda: None)
+    except RuntimeError as error:
+        assert str(error) == "NATIVE_READINESS_TIMEOUT"
+    else:
+        raise AssertionError("late HTTP 200 must not pass")
+    simulated[0] = 0.0
+    def late_completion(request, timeout):
+        assert 0 < timeout <= 1
+        simulated[0] = 2.0
+        return HealthyResponse()
+    try:
+        open_native_completion_when_ready(
+            object(), 1, MEMORY_FLOOR_MIB, opener=late_completion,
+            clock=lambda: simulated[0], sleep=lambda _: None,
+            check_headroom=lambda: None)
+    except RuntimeError as error:
+        assert str(error) == "NATIVE_COMPLETION_LOADING_TIMEOUT"
+    else:
+        raise AssertionError("late HTTP 200 completion must not pass")
     fake_o = [b'{"response":"OK","done":false}\n',
               b'{"response":"","done":true,"eval_count":1,"eval_duration":1000000000}\n']
     fake_n = [b'data: {"content":"OK","stop":false}\n',
