@@ -70,16 +70,18 @@ def native_model_blob(item, root):
     status = item.get("status") if isinstance(item, dict) else None
     argv = status.get("args") if isinstance(status, dict) else None
     if not isinstance(argv, list) or argv.count("--model") != 1:
-        return None
+        return None, "unresolved_native_model_path"
     idx = argv.index("--model")
     if idx + 1 >= len(argv) or not isinstance(argv[idx + 1], str):
-        return None
+        return None, "unresolved_native_model_path"
     path = Path(argv[idx + 1])
     digest = sha(path.name)
     expected = root / "blobs" / ("sha256-" + digest) if digest else None
-    if not expected or path != expected or not regular_file(path):
-        return None
-    return digest
+    if not expected or path != expected:
+        return None, "noncanonical_native_model_path"
+    if not regular_file(path):
+        return None, "missing_native_blob"
+    return digest, None
 
 
 def reconcile(ollama_catalog, native_catalog, manifests, root):
@@ -101,9 +103,9 @@ def reconcile(ollama_catalog, native_catalog, manifests, root):
     for item in native_catalog["data"]:
         if not isinstance(item, dict) or not isinstance(item.get("id"), str):
             raise ValueError("Invalid native catalog entry")
-        digest = native_model_blob(item, root)
+        digest, problem = native_model_blob(item, root)
         matches = sorted(by_digest.get(digest, [])) if digest else []
-        status = ("shared_model_weights" if matches else "native_blob_without_ollama_alias") if digest else "unresolved_native_model_path"
+        status = problem or ("shared_model_weights" if matches else "native_blob_without_ollama_alias")
         native_rows.append({"alias": item["id"], "model_blob_sha256": digest,
                             "ollama_aliases_with_identical_weights": matches, "identity": status})
     native_digests = {row["model_blob_sha256"] for row in native_rows if row["model_blob_sha256"]}
@@ -117,7 +119,8 @@ def reconcile(ollama_catalog, native_catalog, manifests, root):
             "native_weights_not_in_ollama_catalog": sum(x["identity"] == "native_blob_without_ollama_alias" for x in native_rows),
             "ollama_aliases_missing_native_weight": sum(x["identity"] == "ollama_weights_not_in_native_catalog" for x in ollama_rows),
             "unresolved_ollama": sum(x["identity"] == "unresolved_manifest_or_blob" for x in ollama_rows),
-            "unresolved_native": sum(x["identity"] == "unresolved_native_model_path" for x in native_rows),
+            "unresolved_native": sum(x["identity"] in ("unresolved_native_model_path", "noncanonical_native_model_path", "missing_native_blob") for x in native_rows),
+            "missing_native_blobs": sum(x["identity"] == "missing_native_blob" for x in native_rows),
         },
         "ollama": sorted(ollama_rows, key=lambda x: x["alias"]),
         "native": sorted(native_rows, key=lambda x: x["alias"]),
@@ -158,7 +161,7 @@ def selftest(test_root):
             "native_aliases_matching_ollama_weights": 1,
             "native_weights_not_in_ollama_catalog": 0,
             "ollama_aliases_missing_native_weight": 0,
-            "unresolved_ollama": 1, "unresolved_native": 2,
+            "unresolved_ollama": 1, "unresolved_native": 2, "missing_native_blobs": 1,
         }
         assert next(x for x in result["native"] if x["alias"] == "TINY")["ollama_aliases_with_identical_weights"] == ["tiny:latest"]
         assert manifest_model_blob({"layers": [
