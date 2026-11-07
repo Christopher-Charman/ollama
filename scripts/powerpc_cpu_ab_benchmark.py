@@ -137,13 +137,45 @@ def prompt_stats(engine, final):
     return tokens, ms, tps
 
 
-def measure(engine, model):
+def open_native_completion_when_ready(request, timeout_seconds, min_mib, *,
+                                      opener=urllib.request.urlopen,
+                                      clock=time.monotonic, sleep=time.sleep,
+                                      check_headroom=None):
+    """Retry only HTTP 503 received before any inference stream exists."""
+    if check_headroom is None:
+        check_headroom = lambda: require_headroom(min_mib)
+    started = clock()
+    loading_retries = 0
+    while True:
+        check_headroom()
+        try:
+            return opener(request, timeout=110), loading_retries
+        except urllib.error.HTTPError as error:
+            status = error.code
+            error.close()
+            if status != 503:
+                raise
+            loading_retries += 1
+            remaining = timeout_seconds - (clock() - started)
+            if remaining <= 0:
+                raise RuntimeError("NATIVE_COMPLETION_LOADING_TIMEOUT")
+            sleep(min(1, remaining))
+
+
+def measure(engine, model, *, native_ready_timeout_seconds=180,
+            min_available_mib=MEMORY_FLOOR_MIB):
     obj = payload(engine, model)
     url = OLLAMA if engine == "ollama" else NATIVE
     req = urllib.request.Request(url, json.dumps(obj).encode("utf-8"),
                                  {"Content-Type": "application/json"})
     started = time.monotonic()
-    with urllib.request.urlopen(req, timeout=110) as stream:
+    if engine == "native":
+        stream, loading_retries = open_native_completion_when_ready(
+            req, native_ready_timeout_seconds, min_available_mib)
+    else:
+        stream = urllib.request.urlopen(req, timeout=110)
+        loading_retries = None
+    with stream:
         if stream.status != 200:
             raise RuntimeError("NON_200_HTTP")
         ttft, output, final = decode_stream(engine, stream, started)
@@ -156,6 +188,7 @@ def measure(engine, model):
     return {
         "engine": engine, "model": model, "wall_ms": elapsed,
         "ttft_ms": ttft, "generated_tokens": gen,
+        "native_loading_503_retries": loading_retries,
         "generation_tps": round(gen * 1000.0 / decode_ms, 3) if decode_ms else None,
         "prompt_tokens": prompt_tokens, "prompt_eval_ms": prompt_ms,
         "prompt_eval_tps": prompt_tps,
@@ -236,6 +269,27 @@ def selftest():
         assert str(error) == "NATIVE_READINESS_UNEXPECTED_HTTP_500"
     else:
         raise AssertionError("non-loading HTTP 500 must fail")
+    requests_seen = []
+    response_codes = iter((503, 200))
+    def pre_stream_opener(request, timeout):
+        assert timeout == 110
+        requests_seen.append(request)
+        code = next(response_codes)
+        if code == 503:
+            raise urllib.error.HTTPError(NATIVE, 503, "loading", None, None)
+        return HealthyResponse()
+    stream, retries = open_native_completion_when_ready(
+        object(), 5, MEMORY_FLOOR_MIB, opener=pre_stream_opener,
+        sleep=lambda _: None, check_headroom=lambda: None)
+    assert stream.status == 200 and retries == 1 and len(requests_seen) == 2
+    try:
+        open_native_completion_when_ready(
+            object(), 5, MEMORY_FLOOR_MIB, opener=broken_opener,
+            sleep=lambda _: None, check_headroom=lambda: None)
+    except urllib.error.HTTPError as error:
+        assert error.code == 500
+    else:
+        raise AssertionError("unexpected completion HTTP 500 must fail")
     fake_o = [b'{"response":"OK","done":false}\n',
               b'{"response":"","done":true,"eval_count":1,"eval_duration":1000000000}\n']
     fake_n = [b'data: {"content":"OK","stop":false}\n',
@@ -347,7 +401,9 @@ def main(argv=None):
             receipt.write(json.dumps(header, sort_keys=True) + "\n")
             for block, repetition, engine in trials:
                 before = require_headroom(args.min_available_mib)
-                measured = measure(engine, args.model)
+                measured = measure(engine, args.model,
+                                   native_ready_timeout_seconds=args.native_ready_timeout_seconds,
+                                   min_available_mib=args.min_available_mib)
                 if measured["meminfo_after_kib"].get("MemAvailable", 0) < args.min_available_mib * 1024:
                     raise RuntimeError("MEMORY_HEADROOM_BELOW_GATE_AFTER_REQUEST")
                 measured.update({"phase": "first_in_block" if repetition == 0 else "warm",
