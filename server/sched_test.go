@@ -955,6 +955,21 @@ func TestSchedNeedsReload(t *testing.T) {
 	req.opts.NumGPU = -1
 	resp = runner.needsReload(ctx, req)
 	require.False(t, resp)
+
+	// NumThread=0 means automatic, not a demand to discard a resident
+	// runner. A new explicit thread count remains binding.
+	runner.Options.NumThread = 4
+	req.opts.NumThread = 0
+	require.False(t, runner.needsReload(ctx, req))
+	req.opts.NumThread = 5
+	require.True(t, runner.needsReload(ctx, req))
+	req.opts.NumThread = 4
+	require.False(t, runner.needsReload(ctx, req))
+	runner.Options.NumThread = 0
+	require.True(t, runner.needsReload(ctx, req))
+	req.opts.NumThread = 0
+	require.False(t, runner.needsReload(ctx, req))
+
 	req.contextShift = true
 	resp = runner.needsReload(ctx, req)
 	require.True(t, resp)

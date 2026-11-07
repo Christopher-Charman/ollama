@@ -1449,6 +1449,12 @@ func (runner *runnerRef) needsReload(ctx context.Context, req *LlmRequest) bool 
 	if runner.useMMapAuto && optsNew.UseMMap == nil {
 		optsNew.UseMMap = optsExisting.UseMMap
 	}
+	// An automatic thread request does not require replacing a healthy runner
+	// loaded with an explicit thread count. An explicit positive thread count
+	// still requires a reload when it differs from the resident runner.
+	if optsNew.NumThread == 0 {
+		optsExisting.NumThread = 0
+	}
 	if optsNew.NumGPU < 0 {
 		optsExisting.NumGPU = -1
 		optsNew.NumGPU = -1
